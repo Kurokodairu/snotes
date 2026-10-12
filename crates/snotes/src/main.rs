@@ -2,6 +2,7 @@
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod engine;
+mod snap;
 
 #[cfg(feature = "gui")]
 mod canvas;
