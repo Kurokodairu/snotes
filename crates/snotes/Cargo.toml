@@ -8,3 +8,10 @@ license.workspace = true
 [dependencies]
 rnote-engine = { git = "https://github.com/flxzt/rnote", tag = "v0.14.2" }
 rnote-compose = { git = "https://github.com/flxzt/rnote", tag = "v0.14.2" }
+nalgebra = "0.34"
+gtk4 = { version = "0.10", optional = true }
+
+[features]
+# The GTK window. rnote-engine's `ui` feature needs GTK >= 4.18, so this is
+# off by default and tests keep building on older dev machines.
+gui = ["dep:gtk4", "rnote-engine/ui"]
