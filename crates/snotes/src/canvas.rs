@@ -1,7 +1,7 @@
 //! GTK widget that hosts the ink engine: forwards pen input in, draws the
 //! engine out. Phase 0 spike, no page/row model yet.
 
-use crate::engine::{PenSample, PenTool, Update};
+use crate::engine::{PenSample, PenTool, Rgba, Tool, Update};
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gdk, glib, graphene, Native};
@@ -16,6 +16,26 @@ glib::wrapper! {
 impl Canvas {
     pub fn new() -> Self {
         glib::Object::new()
+    }
+
+    pub fn set_tool(&self, tool: Tool) {
+        let update = self.imp().engine.borrow_mut().set_tool(tool);
+        self.apply(update);
+    }
+
+    pub fn set_pen_style(&self, colour: Rgba, width: f64) {
+        let update = self.imp().engine.borrow_mut().set_pen_style(colour, width);
+        self.apply(update);
+    }
+
+    pub fn undo(&self) {
+        let update = self.imp().engine.borrow_mut().undo(Instant::now());
+        self.apply(update);
+    }
+
+    pub fn redo(&self) {
+        let update = self.imp().engine.borrow_mut().redo(Instant::now());
+        self.apply(update);
     }
 
     fn apply(&self, update: Update) {

@@ -6,6 +6,8 @@ mod snap;
 
 #[cfg(feature = "gui")]
 mod canvas;
+#[cfg(feature = "gui")]
+mod toolbar;
 
 #[cfg(feature = "gui")]
 fn main() -> gtk4::glib::ExitCode {
@@ -15,12 +17,16 @@ fn main() -> gtk4::glib::ExitCode {
         .application_id("dev.snotes.Spike")
         .build();
     app.connect_activate(|app| {
+        let canvas = canvas::Canvas::new();
+        let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layout.append(&toolbar::build(&canvas));
+        layout.append(&canvas);
         let window = gtk4::ApplicationWindow::builder()
             .application(app)
             .title("SnoteS spike")
             .default_width(1000)
             .default_height(700)
-            .child(&canvas::Canvas::new())
+            .child(&layout)
             .build();
         window.present();
     });

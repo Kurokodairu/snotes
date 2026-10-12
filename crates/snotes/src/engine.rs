@@ -112,6 +112,7 @@ impl InkEngine {
         }
     }
 
+    #[cfg(test)]
     pub fn tool(&self) -> Tool {
         self.tool
     }
