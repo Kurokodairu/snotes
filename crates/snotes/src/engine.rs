@@ -1,6 +1,7 @@
 //! Adapter around rnote-engine. Every call into the engine goes through this
 //! module, because the upstream API is not stable.
 
+use crate::snap::{SnapDetector, SnapEvent};
 use rnote_compose::builders::ShapeBuilderType;
 use rnote_compose::penevent::PenEvent;
 use rnote_compose::penpath::Element;
@@ -63,6 +64,13 @@ impl From<Rgba> for rnote_compose::Color {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PenEventKind {
+    Down,
+    Up,
+    Proximity,
+}
+
 /// What the widget has to do after an engine call.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Update {
@@ -82,6 +90,11 @@ pub struct InkEngine {
     inner: Engine,
     config: EngineConfigShared,
     tool: Tool,
+    snap: SnapDetector,
+    /// A stroke is currently down.
+    stroking: bool,
+    /// The live stroke has been snapped to a line (the shaper tool is active).
+    snapped: bool,
 }
 
 impl InkEngine {
@@ -93,6 +106,9 @@ impl InkEngine {
             inner,
             config,
             tool: Tool::Pen,
+            snap: SnapDetector::new(),
+            stroking: false,
+            snapped: false,
         }
     }
 
@@ -210,39 +226,115 @@ impl InkEngine {
     }
 
     pub fn pen_down(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
-        let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Down {
-                element,
-                modifier_keys: HashSet::new(),
-            },
-            tool,
-            now,
-        )
+        let snappable = tool == PenTool::Pen && matches!(self.tool, Tool::Pen | Tool::Highlighter);
+        if !self.stroking {
+            self.stroking = true;
+            self.snap.reset();
+        }
+        let mut update = self.send(PenEventKind::Down, sample, tool, now);
+        if snappable && !self.snapped {
+            if let SnapEvent::Snapped { start } = self.snap.push(sample, now) {
+                update.redraw |= self.begin_snapped_line(start, sample, tool, now).redraw;
+            }
+        }
+        update
     }
 
     pub fn pen_up(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
-        let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Up {
-                element,
-                modifier_keys: HashSet::new(),
-            },
-            tool,
-            now,
-        )
+        let update = self.send(PenEventKind::Up, sample, tool, now);
+        self.end_stroke(update)
     }
 
     pub fn pen_proximity(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
+        // The canvas reports a lifted stylus as proximity, never as pen-up, so
+        // a snapped line has to be committed here.
+        let kind = if self.snapped {
+            PenEventKind::Up
+        } else {
+            PenEventKind::Proximity
+        };
+        let update = self.send(kind, sample, tool, now);
+        self.end_stroke(update)
+    }
+
+    fn end_stroke(&mut self, mut update: Update) -> Update {
+        self.stroking = false;
+        self.snap.reset();
+        if self.snapped {
+            self.snapped = false;
+            update.redraw |= self.set_tool(self.tool).redraw;
+        }
+        update
+    }
+
+    /// Replace the live brush stroke by a shaper line from `start` to `end`.
+    fn begin_snapped_line(
+        &mut self,
+        start: PenSample,
+        end: PenSample,
+        tool: PenTool,
+        now: Instant,
+    ) -> Update {
+        let mut update: Update = self
+            .inner
+            .handle_pen_event(PenEvent::Cancel, None, now)
+            .1
+            .into();
+        {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            let (colour, width) = match self.tool {
+                Tool::Highlighter => (
+                    pens.brush_config.marker_options.stroke_color,
+                    pens.brush_config.marker_options.stroke_width,
+                ),
+                _ => (
+                    pens.brush_config.solid_options.stroke_color,
+                    pens.brush_config.solid_options.stroke_width,
+                ),
+            };
+            pens.shaper_config.builder_type = ShapeBuilderType::Line;
+            pens.shaper_config.smooth_options.stroke_color = colour;
+            pens.shaper_config.smooth_options.stroke_width = width;
+        }
+        // Cancel still commits the partial brush stroke; take it back out.
+        update.redraw |= self.inner.undo(now).redraw;
+        update.redraw |= self.inner.change_pen_style(PenStyle::Shaper).redraw;
+        self.snapped = true;
+        update.redraw |= self.send(PenEventKind::Down, start, tool, now).redraw;
+        update.redraw |= self.send(PenEventKind::Down, end, tool, now).redraw;
+        update
+    }
+
+    #[cfg(test)]
+    fn is_snapped(&self) -> bool {
+        self.snapped
+    }
+
+    fn send(
+        &mut self,
+        kind: PenEventKind,
+        sample: PenSample,
+        tool: PenTool,
+        now: Instant,
+    ) -> Update {
         let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Proximity {
+        let modifier_keys = HashSet::new();
+        let event = match kind {
+            PenEventKind::Down => PenEvent::Down {
                 element,
-                modifier_keys: HashSet::new(),
+                modifier_keys,
             },
-            tool,
-            now,
-        )
+            PenEventKind::Up => PenEvent::Up {
+                element,
+                modifier_keys,
+            },
+            PenEventKind::Proximity => PenEvent::Proximity {
+                element,
+                modifier_keys,
+            },
+        };
+        self.pen_event(event, tool, now)
     }
 
     fn pen_event(&mut self, event: PenEvent, tool: PenTool, now: Instant) -> Update {
@@ -276,6 +368,7 @@ impl Default for InkEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn new_engine_has_a_document() {
@@ -352,5 +445,79 @@ mod tests {
             e.config.read().pens_config.brush_config.style,
             BrushStyle::Solid
         );
+    }
+
+    /// Draw a straight line, hold still, then move the end and lift.
+    fn snap_stroke(e: &mut InkEngine, lift_with_proximity: bool) -> Instant {
+        let t0 = Instant::now();
+        let p = |x: f64, y: f64| PenSample {
+            x,
+            y,
+            pressure: 0.6,
+        };
+        e.pen_proximity(p(100.0, 100.0), PenTool::Pen, t0);
+        for i in 0..=20 {
+            let at = t0 + Duration::from_millis(10 * i);
+            e.pen_down(p(100.0 + 10.0 * i as f64, 100.0), PenTool::Pen, at);
+        }
+        let held = t0 + Duration::from_millis(200);
+        e.pen_down(
+            p(300.0, 100.0),
+            PenTool::Pen,
+            held + Duration::from_millis(400),
+        );
+        assert!(e.is_snapped());
+        let end = held + Duration::from_millis(450);
+        e.pen_down(p(300.0, 160.0), PenTool::Pen, end);
+        if lift_with_proximity {
+            e.pen_proximity(p(300.0, 160.0), PenTool::Pen, end);
+        } else {
+            e.pen_up(p(300.0, 160.0), PenTool::Pen, end);
+        }
+        end
+    }
+
+    #[test]
+    fn held_straight_stroke_becomes_one_line() {
+        let mut e = active();
+        snap_stroke(&mut e, false);
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+        assert_eq!(e.tool(), Tool::Pen);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Brush);
+    }
+
+    #[test]
+    fn snapped_line_is_one_undo_step() {
+        let mut e = active();
+        snap_stroke(&mut e, false);
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 0);
+    }
+
+    #[test]
+    fn release_before_hold_commits_normal_stroke() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 100.0));
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn proximity_loss_while_snapped_resets_state() {
+        let mut e = active();
+        snap_stroke(&mut e, true);
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Brush);
+    }
+
+    #[test]
+    fn second_stroke_after_snap_starts_fresh() {
+        let mut e = active();
+        snap_stroke(&mut e, false);
+        stroke(&mut e, PenTool::Pen, (100.0, 300.0), (300.0, 340.0));
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 2);
     }
 }
