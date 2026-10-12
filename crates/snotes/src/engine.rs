@@ -163,6 +163,28 @@ impl InkEngine {
         self.inner.reinstall_pen_current_style().into()
     }
 
+    /// Move the view so the content follows a drag of (dx, dy) widget pixels.
+    pub fn pan_by(&mut self, dx: f64, dy: f64) -> Update {
+        let offset = self.inner.camera.offset() - nalgebra::vector![dx, dy];
+        let flags = self.inner.camera_set_offset_expand(offset)
+            | self.inner.update_rendering_current_viewport();
+        flags.into()
+    }
+
+    /// Zoom by `factor` about the widget point (cx, cy), which stays fixed.
+    pub fn zoom_by(&mut self, factor: f64, cx: f64, cy: f64) -> Update {
+        let camera = &self.inner.camera;
+        let focus = nalgebra::vector![cx, cy];
+        let doc_point = (camera.offset() + focus) / camera.total_zoom();
+        let mut flags = self.inner.camera.zoom_to(camera.zoom() * factor);
+        let zoom = self.inner.camera.total_zoom();
+        flags |= self
+            .inner
+            .camera_set_offset_expand(doc_point * zoom - focus);
+        flags |= self.inner.update_rendering_current_viewport();
+        flags.into()
+    }
+
     pub fn undo(&mut self, now: Instant) -> Update {
         self.inner.undo(now).into()
     }
@@ -520,5 +542,43 @@ mod tests {
         stroke(&mut e, PenTool::Pen, (100.0, 300.0), (300.0, 340.0));
         assert!(!e.is_snapped());
         assert_eq!(e.undo_depth(), 2);
+    }
+
+    #[test]
+    fn pan_by_moves_camera_offset() {
+        // A viewport smaller than the document, so the offset is not clamped to zero.
+        let mut e = InkEngine::new();
+        e.set_viewport_size(200.0, 100.0);
+        let start = e.inner.camera.offset().y;
+        e.pan_by(0.0, -80.0);
+        assert_eq!(e.inner.camera.offset().y, start + 80.0);
+        e.pan_by(0.0, 30.0);
+        assert_eq!(e.inner.camera.offset().y, start + 50.0);
+    }
+
+    #[test]
+    fn zoom_by_clamps() {
+        let mut e = active();
+        e.zoom_by(100.0, 400.0, 300.0);
+        assert_eq!(
+            e.inner.camera.zoom(),
+            rnote_engine::camera::Camera::ZOOM_MAX
+        );
+        e.zoom_by(1e-6, 400.0, 300.0);
+        assert_eq!(
+            e.inner.camera.zoom(),
+            rnote_engine::camera::Camera::ZOOM_MIN
+        );
+    }
+
+    #[test]
+    fn zoom_keeps_focus_point_fixed() {
+        let mut e = active();
+        e.pan_by(0.0, -200.0);
+        let focus = nalgebra::point![300.0, 250.0];
+        let before = e.inner.camera.transform().inverse() * focus;
+        e.zoom_by(2.0, focus.x, focus.y);
+        let after = e.inner.camera.transform().inverse() * focus;
+        assert!((before - after).norm() < 1e-6, "{before} vs {after}");
     }
 }

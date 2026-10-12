@@ -28,6 +28,16 @@ impl Canvas {
         self.apply(update);
     }
 
+    fn pan_by(&self, dx: f64, dy: f64) {
+        let update = self.imp().engine.borrow_mut().pan_by(dx, dy);
+        self.apply(update);
+    }
+
+    fn zoom_by(&self, factor: f64, cx: f64, cy: f64) {
+        let update = self.imp().engine.borrow_mut().zoom_by(factor, cx, cy);
+        self.apply(update);
+    }
+
     pub fn undo(&self) {
         let update = self.imp().engine.borrow_mut().undo(Instant::now());
         self.apply(update);
@@ -80,6 +90,9 @@ mod imp {
         pub(super) pen_state: Cell<PenState>,
         /// Print every raw pen event to stderr (set `SNOTES_LOG_PEN=1`).
         pub(super) log_pen: Cell<bool>,
+        /// Last cumulative drag offset / pinch scale, to turn them into deltas.
+        pub(super) drag_last: Cell<(f64, f64)>,
+        pub(super) zoom_last: Cell<f64>,
     }
 
     #[glib::object_subclass]
@@ -125,6 +138,43 @@ mod imp {
                 move |_, event| obj.imp().handle_event(event)
             ));
             obj.add_controller(controller);
+
+            // Touch navigation: one finger pans, two fingers pinch-zoom.
+            // Both are touch-only, so the pen never triggers them.
+            let drag = gtk4::GestureDrag::new();
+            drag.set_touch_only(true);
+            drag.connect_drag_update(glib::clone!(
+                #[weak]
+                obj,
+                move |_, x, y| {
+                    let (lx, ly) = obj.imp().drag_last.replace((x, y));
+                    obj.pan_by(x - lx, y - ly);
+                }
+            ));
+            drag.connect_drag_begin(glib::clone!(
+                #[weak]
+                obj,
+                move |_, _, _| obj.imp().drag_last.set((0.0, 0.0))
+            ));
+            obj.add_controller(drag);
+
+            let zoom = gtk4::GestureZoom::new();
+            zoom.connect_begin(glib::clone!(
+                #[weak]
+                obj,
+                move |_, _| obj.imp().zoom_last.set(1.0)
+            ));
+            zoom.connect_scale_changed(glib::clone!(
+                #[weak]
+                obj,
+                move |g, scale| {
+                    let last = obj.imp().zoom_last.replace(scale);
+                    if let Some((cx, cy)) = g.bounding_box_center() {
+                        obj.zoom_by(scale / last, cx, cy);
+                    }
+                }
+            ));
+            obj.add_controller(zoom);
         }
     }
 
