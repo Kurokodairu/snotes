@@ -52,6 +52,7 @@ impl InkEngine {
     }
 
     /// Current document size in engine units, as (width, height).
+    #[cfg_attr(feature = "gui", allow(dead_code))]
     pub fn document_size(&self) -> (f64, f64) {
         (self.inner.document.width, self.inner.document.height)
     }

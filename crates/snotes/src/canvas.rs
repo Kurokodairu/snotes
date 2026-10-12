@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 glib::wrapper! {
     pub struct Canvas(ObjectSubclass<imp::Canvas>)
-        @extends gtk4::Widget;
+        @extends gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
 }
 
 impl Canvas {
@@ -55,10 +56,10 @@ mod imp {
 
     #[derive(Default)]
     pub struct Canvas {
-        pub engine: RefCell<InkEngine>,
-        pub pen_state: Cell<PenState>,
+        pub(super) engine: RefCell<InkEngine>,
+        pub(super) pen_state: Cell<PenState>,
         /// Print every raw pen event to stderr (set `SNOTES_LOG_PEN=1`).
-        pub log_pen: Cell<bool>,
+        pub(super) log_pen: Cell<bool>,
     }
 
     #[glib::object_subclass]
