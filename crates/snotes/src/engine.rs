@@ -1,13 +1,19 @@
 //! Adapter around rnote-engine. Every call into the engine goes through this
 //! module, because the upstream API is not stable.
 
+use rnote_compose::builders::ShapeBuilderType;
 use rnote_compose::penevent::PenEvent;
 use rnote_compose::penpath::Element;
+use rnote_engine::engine::{EngineConfig, EngineConfigShared};
 use rnote_engine::engine::{EngineTask, EngineTaskReceiver};
-use rnote_engine::pens::PenMode;
+use rnote_engine::pens::pensconfig::brushconfig::BrushStyle;
+use rnote_engine::pens::{PenMode, PenStyle};
 use rnote_engine::{Engine, WidgetFlags};
 use std::collections::HashSet;
 use std::time::Instant;
+
+/// The highlighter is drawn this many times wider than the pen.
+const HIGHLIGHTER_WIDTH_FACTOR: f64 = 3.0;
 
 /// One pen sample in widget coordinates (logical pixels, origin top-left).
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +29,38 @@ pub struct PenSample {
 pub enum PenTool {
     Pen,
     Eraser,
+}
+
+/// The tool selected in the toolbar. The stylus eraser end overrides it while touching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Pen,
+    Highlighter,
+    Eraser,
+    Shaper(ShapeKind),
+    Lasso,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeKind {
+    Line,
+    Rect,
+    Ellipse,
+}
+
+/// Colour with components in 0.0..=1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgba(pub f32, pub f32, pub f32, pub f32);
+
+impl From<Rgba> for rnote_compose::Color {
+    fn from(c: Rgba) -> Self {
+        rnote_compose::Color::new(
+            f64::from(c.0),
+            f64::from(c.1),
+            f64::from(c.2),
+            f64::from(c.3),
+        )
+    }
 }
 
 /// What the widget has to do after an engine call.
@@ -42,13 +80,94 @@ impl From<WidgetFlags> for Update {
 /// Owns the rnote engine instance behind SnoteS' own interface.
 pub struct InkEngine {
     inner: Engine,
+    config: EngineConfigShared,
+    tool: Tool,
 }
 
 impl InkEngine {
     pub fn new() -> Self {
+        let mut inner = Engine::default();
+        let config = EngineConfigShared::from(EngineConfig::default());
+        let _ = inner.install_config(&config, None);
         Self {
-            inner: Engine::default(),
+            inner,
+            config,
+            tool: Tool::Pen,
         }
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    pub fn set_tool(&mut self, tool: Tool) -> Update {
+        self.tool = tool;
+        let style = {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            match tool {
+                Tool::Pen => {
+                    pens.brush_config.style = BrushStyle::Solid;
+                    PenStyle::Brush
+                }
+                Tool::Highlighter => {
+                    pens.brush_config.style = BrushStyle::Marker;
+                    PenStyle::Brush
+                }
+                Tool::Eraser => PenStyle::Eraser,
+                Tool::Shaper(kind) => {
+                    pens.shaper_config.builder_type = match kind {
+                        ShapeKind::Line => ShapeBuilderType::Line,
+                        ShapeKind::Rect => ShapeBuilderType::Rectangle,
+                        ShapeKind::Ellipse => ShapeBuilderType::Ellipse,
+                    };
+                    PenStyle::Shaper
+                }
+                Tool::Lasso => PenStyle::Selector,
+            }
+        };
+        let flags = self.inner.change_pen_style(style);
+        flags.into()
+    }
+
+    /// Stroke colour and width (logical px) for pen, highlighter and shapes.
+    pub fn set_pen_style(&mut self, colour: Rgba, width: f64) -> Update {
+        {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            let colour = rnote_compose::Color::from(colour);
+            pens.brush_config.solid_options.stroke_color = Some(colour);
+            pens.brush_config.solid_options.stroke_width = width;
+            pens.brush_config.marker_options.stroke_color = Some(colour);
+            pens.brush_config.marker_options.stroke_width = width * HIGHLIGHTER_WIDTH_FACTOR;
+            pens.shaper_config.smooth_options.stroke_color = Some(colour);
+            pens.shaper_config.smooth_options.stroke_width = width;
+        }
+        self.inner.reinstall_pen_current_style().into()
+    }
+
+    pub fn undo(&mut self, now: Instant) -> Update {
+        self.inner.undo(now).into()
+    }
+
+    pub fn redo(&mut self, now: Instant) -> Update {
+        self.inner.redo(now).into()
+    }
+
+    /// Number of undo steps available. Stands in for a stroke count in tests,
+    /// because the engine's store keys are not public.
+    #[cfg(test)]
+    fn undo_depth(&mut self) -> usize {
+        let now = Instant::now();
+        let mut n = 0;
+        while self.inner.can_undo() {
+            let _ = self.inner.undo(now);
+            n += 1;
+        }
+        for _ in 0..n {
+            let _ = self.inner.redo(now);
+        }
+        n
     }
 
     /// Current document size in engine units, as (width, height).
@@ -162,5 +281,76 @@ mod tests {
     fn new_engine_has_a_document() {
         let (w, h) = InkEngine::new().document_size();
         assert!(w > 0.0 && h > 0.0);
+    }
+
+    fn stroke(e: &mut InkEngine, tool: PenTool, from: (f64, f64), to: (f64, f64)) {
+        let t = Instant::now();
+        let at = |f: f64| PenSample {
+            x: from.0 + (to.0 - from.0) * f,
+            y: from.1 + (to.1 - from.1) * f,
+            pressure: 0.5,
+        };
+        e.pen_proximity(at(0.0), tool, t);
+        e.pen_down(at(0.0), tool, t);
+        for i in 1..=10 {
+            e.pen_down(at(f64::from(i) / 10.0), tool, t);
+        }
+        e.pen_up(at(1.0), tool, t);
+    }
+
+    fn active() -> InkEngine {
+        let mut e = InkEngine::new();
+        e.set_viewport_size(800.0, 600.0);
+        e
+    }
+
+    #[test]
+    fn set_tool_changes_current_tool() {
+        let mut e = active();
+        e.set_tool(Tool::Shaper(ShapeKind::Rect));
+        assert_eq!(e.tool(), Tool::Shaper(ShapeKind::Rect));
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Shaper);
+    }
+
+    #[test]
+    fn pen_stroke_adds_one_stroke() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 120.0));
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn undo_removes_stroke_redo_restores() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 120.0));
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 0);
+        e.redo(Instant::now());
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn eraser_end_override_restores_selected_tool() {
+        let mut e = active();
+        e.set_tool(Tool::Shaper(ShapeKind::Rect));
+        stroke(&mut e, PenTool::Eraser, (100.0, 100.0), (200.0, 100.0));
+        stroke(&mut e, PenTool::Pen, (100.0, 200.0), (200.0, 260.0));
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Shaper);
+        assert_eq!(e.tool(), Tool::Shaper(ShapeKind::Rect));
+    }
+
+    #[test]
+    fn highlighter_uses_marker_style() {
+        let mut e = active();
+        e.set_tool(Tool::Highlighter);
+        assert_eq!(
+            e.config.read().pens_config.brush_config.style,
+            BrushStyle::Marker
+        );
+        e.set_tool(Tool::Pen);
+        assert_eq!(
+            e.config.read().pens_config.brush_config.style,
+            BrushStyle::Solid
+        );
     }
 }
