@@ -1,13 +1,23 @@
 //! Adapter around rnote-engine. Every call into the engine goes through this
 //! module, because the upstream API is not stable.
 
+use crate::snap::{SnapDetector, SnapEvent};
+use rnote_compose::builders::ShapeBuilderType;
 use rnote_compose::penevent::PenEvent;
 use rnote_compose::penpath::Element;
+use rnote_engine::engine::{EngineConfig, EngineConfigShared};
 use rnote_engine::engine::{EngineTask, EngineTaskReceiver};
-use rnote_engine::pens::PenMode;
+use rnote_engine::pens::pensconfig::brushconfig::BrushStyle;
+use rnote_engine::pens::{PenMode, PenStyle};
 use rnote_engine::{Engine, WidgetFlags};
 use std::collections::HashSet;
 use std::time::Instant;
+
+/// The highlighter is drawn this many times wider than the pen.
+const HIGHLIGHTER_WIDTH_FACTOR: f64 = 3.0;
+
+/// rnote's brush ignores pen-down this far outside the document (`INPUT_OVERSHOOT` upstream).
+const BRUSH_INPUT_OVERSHOOT: f64 = 30.0;
 
 /// One pen sample in widget coordinates (logical pixels, origin top-left).
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +33,45 @@ pub struct PenSample {
 pub enum PenTool {
     Pen,
     Eraser,
+}
+
+/// The tool selected in the toolbar. The stylus eraser end overrides it while touching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Pen,
+    Highlighter,
+    Eraser,
+    Shaper(ShapeKind),
+    Lasso,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeKind {
+    Line,
+    Rect,
+    Ellipse,
+}
+
+/// Colour with components in 0.0..=1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgba(pub f32, pub f32, pub f32, pub f32);
+
+impl From<Rgba> for rnote_compose::Color {
+    fn from(c: Rgba) -> Self {
+        rnote_compose::Color::new(
+            f64::from(c.0),
+            f64::from(c.1),
+            f64::from(c.2),
+            f64::from(c.3),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PenEventKind {
+    Down,
+    Up,
+    Proximity,
 }
 
 /// What the widget has to do after an engine call.
@@ -42,13 +91,134 @@ impl From<WidgetFlags> for Update {
 /// Owns the rnote engine instance behind SnoteS' own interface.
 pub struct InkEngine {
     inner: Engine,
+    config: EngineConfigShared,
+    tool: Tool,
+    snap: SnapDetector,
+    /// Last colour and width from the toolbar.
+    style: Option<(Rgba, f64)>,
+    /// The current stroke started where the brush accepts input.
+    stroke_in_bounds: bool,
+    /// A stroke is currently down.
+    stroking: bool,
+    /// The live stroke has been snapped to a line (the shaper tool is active).
+    snapped: bool,
 }
 
 impl InkEngine {
     pub fn new() -> Self {
+        let mut inner = Engine::default();
+        let config = EngineConfigShared::from(EngineConfig::default());
+        let _ = inner.install_config(&config, None);
         Self {
-            inner: Engine::default(),
+            inner,
+            config,
+            tool: Tool::Pen,
+            snap: SnapDetector::new(),
+            style: None,
+            stroke_in_bounds: false,
+            stroking: false,
+            snapped: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    pub fn set_tool(&mut self, tool: Tool) -> Update {
+        self.tool = tool;
+        let style = {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            match tool {
+                Tool::Pen => {
+                    pens.brush_config.style = BrushStyle::Solid;
+                    PenStyle::Brush
+                }
+                Tool::Highlighter => {
+                    pens.brush_config.style = BrushStyle::Marker;
+                    PenStyle::Brush
+                }
+                Tool::Eraser => PenStyle::Eraser,
+                Tool::Shaper(kind) => {
+                    pens.shaper_config.builder_type = match kind {
+                        ShapeKind::Line => ShapeBuilderType::Line,
+                        ShapeKind::Rect => ShapeBuilderType::Rectangle,
+                        ShapeKind::Ellipse => ShapeBuilderType::Ellipse,
+                    };
+                    PenStyle::Shaper
+                }
+                Tool::Lasso => PenStyle::Selector,
+            }
+        };
+        // The engine writes the style into the slot of its current pen mode, which
+        // stays Eraser after the eraser end lifts; select the Pen slot first.
+        let flags = self.inner.change_pen_mode(PenMode::Pen) | self.inner.change_pen_style(style);
+        flags.into()
+    }
+
+    /// Stroke colour and width (logical px) for pen, highlighter and shapes.
+    pub fn set_pen_style(&mut self, colour: Rgba, width: f64) -> Update {
+        self.style = Some((colour, width));
+        {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            let colour = rnote_compose::Color::from(colour);
+            pens.brush_config.solid_options.stroke_color = Some(colour);
+            pens.brush_config.solid_options.stroke_width = width;
+            pens.brush_config.marker_options.stroke_color = Some(colour);
+            pens.brush_config.marker_options.stroke_width = width * HIGHLIGHTER_WIDTH_FACTOR;
+            pens.shaper_config.smooth_options.stroke_color = Some(colour);
+            pens.shaper_config.smooth_options.stroke_width = width;
+        }
+        self.inner.reinstall_pen_current_style().into()
+    }
+
+    /// Move the view so the content follows a drag of (dx, dy) widget pixels.
+    pub fn pan_by(&mut self, dx: f64, dy: f64) -> Update {
+        let offset = self.inner.camera.offset() - nalgebra::vector![dx, dy];
+        let flags = self.inner.camera_set_offset_expand(offset)
+            | self.inner.update_rendering_current_viewport();
+        flags.into()
+    }
+
+    /// Zoom by `factor` about the widget point (cx, cy), which stays fixed.
+    pub fn zoom_by(&mut self, factor: f64, cx: f64, cy: f64) -> Update {
+        let camera = &self.inner.camera;
+        let focus = nalgebra::vector![cx, cy];
+        let doc_point = (camera.offset() + focus) / camera.total_zoom();
+        let mut flags = self.inner.camera.zoom_to(camera.zoom() * factor);
+        let zoom = self.inner.camera.total_zoom();
+        flags |= self
+            .inner
+            .camera_set_offset_expand(doc_point * zoom - focus);
+        flags |= self.inner.update_rendering_current_viewport();
+        flags.into()
+    }
+
+    pub fn undo(&mut self, now: Instant) -> Update {
+        self.inner.undo(now).into()
+    }
+
+    pub fn redo(&mut self, now: Instant) -> Update {
+        self.inner.redo(now).into()
+    }
+
+    /// Number of undo steps available. Stands in for a stroke count in tests,
+    /// because the engine's store keys are not public.
+    #[cfg(test)]
+    fn undo_depth(&mut self) -> usize {
+        let now = Instant::now();
+        let mut n = 0;
+        while self.inner.can_undo() {
+            let _ = self.inner.undo(now);
+            n += 1;
+        }
+        for _ in 0..n {
+            let _ = self.inner.redo(now);
+        }
+        n
     }
 
     /// Current document size in engine units, as (width, height).
@@ -91,39 +261,131 @@ impl InkEngine {
     }
 
     pub fn pen_down(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
-        let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Down {
-                element,
-                modifier_keys: HashSet::new(),
-            },
-            tool,
-            now,
-        )
+        let snappable = tool == PenTool::Pen && matches!(self.tool, Tool::Pen | Tool::Highlighter);
+        if !self.stroking {
+            self.stroking = true;
+            self.snap.reset();
+            self.stroke_in_bounds = self.brush_accepts(sample);
+        }
+        let mut update = self.send(PenEventKind::Down, sample, tool, now);
+        if snappable && self.stroke_in_bounds && !self.snapped {
+            if let SnapEvent::Snapped { start } = self.snap.push(sample, now) {
+                update.redraw |= self.begin_snapped_line(start, sample, tool, now).redraw;
+            }
+        }
+        update
     }
 
     pub fn pen_up(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
-        let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Up {
-                element,
-                modifier_keys: HashSet::new(),
-            },
-            tool,
-            now,
-        )
+        let update = self.send(PenEventKind::Up, sample, tool, now);
+        self.end_stroke(update)
     }
 
     pub fn pen_proximity(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
+        // The canvas reports a lifted stylus as proximity, never as pen-up, so
+        // the stroke (snapped or not) has to be committed here.
+        let kind = if self.stroking {
+            PenEventKind::Up
+        } else {
+            PenEventKind::Proximity
+        };
+        let update = self.send(kind, sample, tool, now);
+        self.end_stroke(update)
+    }
+
+    /// Whether the brush starts a stroke at this point (the document, loosened
+    /// by the brush's input overshoot). A snap needs a live brush stroke to cancel.
+    fn brush_accepts(&self, sample: PenSample) -> bool {
+        let p = self.to_doc(sample).pos;
+        let doc = &self.inner.document;
+        p.x >= doc.x - BRUSH_INPUT_OVERSHOOT
+            && p.x <= doc.x + doc.width + BRUSH_INPUT_OVERSHOOT
+            && p.y >= doc.y - BRUSH_INPUT_OVERSHOOT
+            && p.y <= doc.y + doc.height + BRUSH_INPUT_OVERSHOOT
+    }
+
+    fn end_stroke(&mut self, mut update: Update) -> Update {
+        self.stroking = false;
+        self.snap.reset();
+        if self.snapped {
+            self.snapped = false;
+            update.redraw |= self.set_tool(self.tool).redraw;
+            // The snap borrowed the shaper's width and colour.
+            if let Some((colour, width)) = self.style {
+                update.redraw |= self.set_pen_style(colour, width).redraw;
+            }
+        }
+        update
+    }
+
+    /// Replace the live brush stroke by a shaper line from `start` to `end`.
+    fn begin_snapped_line(
+        &mut self,
+        start: PenSample,
+        end: PenSample,
+        tool: PenTool,
+        now: Instant,
+    ) -> Update {
+        let mut update: Update = self
+            .inner
+            .handle_pen_event(PenEvent::Cancel, None, now)
+            .1
+            .into();
+        {
+            let mut config = self.config.write();
+            let pens = &mut config.pens_config;
+            let (colour, width) = match self.tool {
+                Tool::Highlighter => (
+                    pens.brush_config.marker_options.stroke_color,
+                    pens.brush_config.marker_options.stroke_width,
+                ),
+                _ => (
+                    pens.brush_config.solid_options.stroke_color,
+                    pens.brush_config.solid_options.stroke_width,
+                ),
+            };
+            pens.shaper_config.builder_type = ShapeBuilderType::Line;
+            pens.shaper_config.smooth_options.stroke_color = colour;
+            pens.shaper_config.smooth_options.stroke_width = width;
+        }
+        // Cancel still commits the partial brush stroke; take it back out.
+        update.redraw |= self.inner.undo(now).redraw;
+        update.redraw |= self.inner.change_pen_style(PenStyle::Shaper).redraw;
+        self.snapped = true;
+        update.redraw |= self.send(PenEventKind::Down, start, tool, now).redraw;
+        update.redraw |= self.send(PenEventKind::Down, end, tool, now).redraw;
+        update
+    }
+
+    #[cfg(test)]
+    fn is_snapped(&self) -> bool {
+        self.snapped
+    }
+
+    fn send(
+        &mut self,
+        kind: PenEventKind,
+        sample: PenSample,
+        tool: PenTool,
+        now: Instant,
+    ) -> Update {
         let element = self.to_doc(sample);
-        self.pen_event(
-            PenEvent::Proximity {
+        let modifier_keys = HashSet::new();
+        let event = match kind {
+            PenEventKind::Down => PenEvent::Down {
                 element,
-                modifier_keys: HashSet::new(),
+                modifier_keys,
             },
-            tool,
-            now,
-        )
+            PenEventKind::Up => PenEvent::Up {
+                element,
+                modifier_keys,
+            },
+            PenEventKind::Proximity => PenEvent::Proximity {
+                element,
+                modifier_keys,
+            },
+        };
+        self.pen_event(event, tool, now)
     }
 
     fn pen_event(&mut self, event: PenEvent, tool: PenTool, now: Instant) -> Update {
@@ -157,10 +419,261 @@ impl Default for InkEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn new_engine_has_a_document() {
         let (w, h) = InkEngine::new().document_size();
         assert!(w > 0.0 && h > 0.0);
+    }
+
+    fn stroke(e: &mut InkEngine, tool: PenTool, from: (f64, f64), to: (f64, f64)) {
+        let t = Instant::now();
+        let at = |f: f64| PenSample {
+            x: from.0 + (to.0 - from.0) * f,
+            y: from.1 + (to.1 - from.1) * f,
+            pressure: 0.5,
+        };
+        e.pen_proximity(at(0.0), tool, t);
+        e.pen_down(at(0.0), tool, t);
+        for i in 1..=10 {
+            e.pen_down(at(f64::from(i) / 10.0), tool, t);
+        }
+        e.pen_up(at(1.0), tool, t);
+    }
+
+    fn active() -> InkEngine {
+        let mut e = InkEngine::new();
+        e.set_viewport_size(800.0, 600.0);
+        e
+    }
+
+    #[test]
+    fn set_tool_changes_current_tool() {
+        let mut e = active();
+        e.set_tool(Tool::Shaper(ShapeKind::Rect));
+        assert_eq!(e.tool(), Tool::Shaper(ShapeKind::Rect));
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Shaper);
+    }
+
+    #[test]
+    fn pen_stroke_adds_one_stroke() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 120.0));
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn undo_removes_stroke_redo_restores() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 120.0));
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 0);
+        e.redo(Instant::now());
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn eraser_end_override_restores_selected_tool() {
+        let mut e = active();
+        e.set_tool(Tool::Shaper(ShapeKind::Rect));
+        stroke(&mut e, PenTool::Eraser, (100.0, 100.0), (200.0, 100.0));
+        stroke(&mut e, PenTool::Pen, (100.0, 200.0), (200.0, 260.0));
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Shaper);
+        assert_eq!(e.tool(), Tool::Shaper(ShapeKind::Rect));
+    }
+
+    #[test]
+    fn highlighter_uses_marker_style() {
+        let mut e = active();
+        e.set_tool(Tool::Highlighter);
+        assert_eq!(
+            e.config.read().pens_config.brush_config.style,
+            BrushStyle::Marker
+        );
+        e.set_tool(Tool::Pen);
+        assert_eq!(
+            e.config.read().pens_config.brush_config.style,
+            BrushStyle::Solid
+        );
+    }
+
+    /// Draw a straight line, hold still, then move the end and lift.
+    fn snap_stroke(e: &mut InkEngine, lift_with_proximity: bool) -> bool {
+        snap_stroke_at(e, lift_with_proximity, 0.0)
+    }
+
+    /// Returns whether the stroke had snapped after the hold.
+    fn snap_stroke_at(e: &mut InkEngine, lift_with_proximity: bool, dx: f64) -> bool {
+        let t0 = Instant::now();
+        let p = |x: f64, y: f64| PenSample {
+            x,
+            y,
+            pressure: 0.6,
+        };
+        e.pen_proximity(p(dx + 100.0, 100.0), PenTool::Pen, t0);
+        for i in 0..=20 {
+            let at = t0 + Duration::from_millis(10 * i);
+            e.pen_down(p(dx + 100.0 + 10.0 * i as f64, 100.0), PenTool::Pen, at);
+        }
+        let held = t0 + Duration::from_millis(200);
+        e.pen_down(
+            p(dx + 300.0, 100.0),
+            PenTool::Pen,
+            held + Duration::from_millis(400),
+        );
+        let snapped = e.is_snapped();
+        let end = held + Duration::from_millis(450);
+        e.pen_down(p(dx + 300.0, 160.0), PenTool::Pen, end);
+        if lift_with_proximity {
+            e.pen_proximity(p(dx + 300.0, 160.0), PenTool::Pen, end);
+        } else {
+            e.pen_up(p(dx + 300.0, 160.0), PenTool::Pen, end);
+        }
+        snapped
+    }
+
+    #[test]
+    fn held_straight_stroke_becomes_one_line() {
+        let mut e = active();
+        assert!(snap_stroke(&mut e, false));
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+        assert_eq!(e.tool(), Tool::Pen);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Brush);
+    }
+
+    #[test]
+    fn snapped_line_is_one_undo_step() {
+        let mut e = active();
+        snap_stroke(&mut e, false);
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 0);
+    }
+
+    #[test]
+    fn release_before_hold_commits_normal_stroke() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 100.0), (300.0, 100.0));
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn proximity_loss_while_snapped_resets_state() {
+        let mut e = active();
+        snap_stroke(&mut e, true);
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 1);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Brush);
+    }
+
+    #[test]
+    fn second_stroke_after_snap_starts_fresh() {
+        let mut e = active();
+        snap_stroke(&mut e, false);
+        stroke(&mut e, PenTool::Pen, (100.0, 300.0), (300.0, 340.0));
+        assert!(!e.is_snapped());
+        assert_eq!(e.undo_depth(), 2);
+    }
+
+    #[test]
+    fn pan_by_moves_camera_offset() {
+        // A viewport smaller than the document, so the offset is not clamped to zero.
+        let mut e = InkEngine::new();
+        e.set_viewport_size(200.0, 100.0);
+        let start = e.inner.camera.offset().y;
+        e.pan_by(0.0, -80.0);
+        assert_eq!(e.inner.camera.offset().y, start + 80.0);
+        e.pan_by(0.0, 30.0);
+        assert_eq!(e.inner.camera.offset().y, start + 50.0);
+    }
+
+    #[test]
+    fn zoom_by_clamps() {
+        let mut e = active();
+        e.zoom_by(100.0, 400.0, 300.0);
+        assert_eq!(
+            e.inner.camera.zoom(),
+            rnote_engine::camera::Camera::ZOOM_MAX
+        );
+        e.zoom_by(1e-6, 400.0, 300.0);
+        assert_eq!(
+            e.inner.camera.zoom(),
+            rnote_engine::camera::Camera::ZOOM_MIN
+        );
+    }
+
+    #[test]
+    fn zoom_keeps_focus_point_fixed() {
+        let mut e = active();
+        e.pan_by(0.0, -200.0);
+        let focus = nalgebra::point![300.0, 250.0];
+        let before = e.inner.camera.transform().inverse() * focus;
+        e.zoom_by(2.0, focus.x, focus.y);
+        let after = e.inner.camera.transform().inverse() * focus;
+        assert!((before - after).norm() < 1e-6, "{before} vs {after}");
+    }
+
+    #[test]
+    fn tool_chosen_after_eraser_end_applies_to_pen_not_eraser() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Eraser, (100.0, 100.0), (200.0, 100.0));
+        e.set_tool(Tool::Shaper(ShapeKind::Rect));
+        let t = Instant::now();
+        let at = PenSample {
+            x: 50.0,
+            y: 50.0,
+            pressure: 0.5,
+        };
+        e.pen_proximity(at, PenTool::Pen, t);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Shaper);
+        e.pen_proximity(at, PenTool::Eraser, t);
+        assert_eq!(e.inner.current_pen_style_w_override(), PenStyle::Eraser);
+    }
+
+    #[test]
+    fn snap_outside_document_keeps_previous_stroke() {
+        let mut e = active();
+        stroke(&mut e, PenTool::Pen, (100.0, 300.0), (300.0, 340.0));
+        assert!(!snap_stroke_at(&mut e, false, -5000.0));
+        assert_eq!(e.undo_depth(), 1);
+    }
+
+    #[test]
+    fn highlighter_snap_leaves_shaper_width_alone() {
+        let mut e = active();
+        e.set_pen_style(Rgba(0.0, 0.0, 1.0, 1.0), 2.0);
+        e.set_tool(Tool::Highlighter);
+        snap_stroke(&mut e, false);
+        let cfg = e.config.read();
+        let opts = &cfg.pens_config.shaper_config.smooth_options;
+        assert_eq!(opts.stroke_width, 2.0);
+    }
+
+    /// Like `stroke`, but lifts the way the canvas does: as proximity, never pen-up.
+    fn stroke_lifted_as_proximity(e: &mut InkEngine, from: (f64, f64), to: (f64, f64)) {
+        let t = Instant::now();
+        let at = |f: f64| PenSample {
+            x: from.0 + (to.0 - from.0) * f,
+            y: from.1 + (to.1 - from.1) * f,
+            pressure: 0.5,
+        };
+        e.pen_proximity(at(0.0), PenTool::Pen, t);
+        for i in 0..=10 {
+            e.pen_down(at(f64::from(i) / 10.0), PenTool::Pen, t);
+        }
+        e.pen_proximity(at(1.0), PenTool::Pen, t);
+    }
+
+    #[test]
+    fn lifting_as_proximity_ends_the_stroke() {
+        let mut e = active();
+        stroke_lifted_as_proximity(&mut e, (100.0, 100.0), (300.0, 100.0));
+        stroke_lifted_as_proximity(&mut e, (100.0, 300.0), (300.0, 300.0));
+        assert_eq!(e.undo_depth(), 2);
+        // Two separate strokes: one undo leaves the first one intact.
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 1);
     }
 }
