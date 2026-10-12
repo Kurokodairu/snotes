@@ -283,8 +283,8 @@ impl InkEngine {
 
     pub fn pen_proximity(&mut self, sample: PenSample, tool: PenTool, now: Instant) -> Update {
         // The canvas reports a lifted stylus as proximity, never as pen-up, so
-        // a snapped line has to be committed here.
-        let kind = if self.snapped {
+        // the stroke (snapped or not) has to be committed here.
+        let kind = if self.stroking {
             PenEventKind::Up
         } else {
             PenEventKind::Proximity
@@ -649,5 +649,31 @@ mod tests {
         let cfg = e.config.read();
         let opts = &cfg.pens_config.shaper_config.smooth_options;
         assert_eq!(opts.stroke_width, 2.0);
+    }
+
+    /// Like `stroke`, but lifts the way the canvas does: as proximity, never pen-up.
+    fn stroke_lifted_as_proximity(e: &mut InkEngine, from: (f64, f64), to: (f64, f64)) {
+        let t = Instant::now();
+        let at = |f: f64| PenSample {
+            x: from.0 + (to.0 - from.0) * f,
+            y: from.1 + (to.1 - from.1) * f,
+            pressure: 0.5,
+        };
+        e.pen_proximity(at(0.0), PenTool::Pen, t);
+        for i in 0..=10 {
+            e.pen_down(at(f64::from(i) / 10.0), PenTool::Pen, t);
+        }
+        e.pen_proximity(at(1.0), PenTool::Pen, t);
+    }
+
+    #[test]
+    fn lifting_as_proximity_ends_the_stroke() {
+        let mut e = active();
+        stroke_lifted_as_proximity(&mut e, (100.0, 100.0), (300.0, 100.0));
+        stroke_lifted_as_proximity(&mut e, (100.0, 300.0), (300.0, 300.0));
+        assert_eq!(e.undo_depth(), 2);
+        // Two separate strokes: one undo leaves the first one intact.
+        e.undo(Instant::now());
+        assert_eq!(e.undo_depth(), 1);
     }
 }
