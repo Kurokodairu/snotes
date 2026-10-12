@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "build", "type": "cargo", "command": "build", "problemMatcher": ["$rustc"], "group": "build" },
+    { "label": "test", "type": "cargo", "command": "test", "problemMatcher": ["$rustc"], "group": "test" },
+    {
+      "label": "clippy",
+      "type": "cargo",
+      "command": "clippy",
+      "args": ["--all-targets", "--", "-D", "warnings"],
+      "problemMatcher": ["$rustc"]
+    },
+    { "label": "fmt", "type": "cargo", "command": "fmt", "problemMatcher": [] },
+    {
+      "label": "pre-commit check",
+      "dependsOrder": "sequence",
+      "dependsOn": ["fmt", "clippy", "test"],
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+[package]
+name = "snotes"
+description = "Linux handwriting notes app with lecture-PDF annotation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnote-engine = { git = "https://github.com/flxzt/rnote", tag = "v0.14.2" }
+rnote-compose = { git = "https://github.com/flxzt/rnote", tag = "v0.14.2" }

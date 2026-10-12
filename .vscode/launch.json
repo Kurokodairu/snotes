@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug snotes",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": { "args": ["build", "--bin=snotes", "--package=snotes"] },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

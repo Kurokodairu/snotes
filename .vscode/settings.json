@@ -1,0 +1,28 @@
+{
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--all-targets", "--", "-D", "warnings"],
+  "rust-analyzer.cargo.allTargets": true,
+  "rust-analyzer.cargo.targetDir": true,
+  "rust-analyzer.inlayHints.parameterHints.enable": false,
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true,
+    "editor.rulers": [100]
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml",
+    "editor.formatOnSave": true
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on"
+  },
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.cache/**": true
+  },
+  "search.exclude": {
+    "**/target": true
+  }
+}
