@@ -73,7 +73,15 @@ impl SnapDetector {
             .iter()
             .map(|p| ((p.x - start.x) * dy - (p.y - start.y) * dx).abs())
             .fold(0.0, f64::max);
-        if max_dev > SNAP_STRAIGHTNESS * chord {
+        // Position of every point along the chord: the stroke must not run past
+        // either end (out and back along one line is not a line).
+        let (min_t, max_t) = self
+            .path
+            .iter()
+            .map(|p| (p.x - start.x) * dx + (p.y - start.y) * dy)
+            .fold((f64::MAX, f64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+        let slack = SNAP_STRAIGHTNESS * chord;
+        if max_dev > slack || min_t < -slack || max_t > chord + slack {
             return SnapEvent::None;
         }
         self.snapped = true;
@@ -211,6 +219,20 @@ mod tests {
         let t = Instant::now();
         assert!(matches!(d.push(s(5.0, 5.0), t), SnapEvent::None));
         assert!(matches!(hold(&mut d, t, (5.0, 5.0), 500), SnapEvent::None));
+    }
+
+    #[test]
+    fn out_and_back_along_the_chord_does_not_snap() {
+        let mut d = SnapDetector::new();
+        let mut pts = line(61, 0.0);
+        pts.extend((3..60).rev().map(|i| (i as f64 * 5.0, 0.0)));
+        // Ends 15 px from where it started, after going 300 px out.
+        let (t, _) = drive(&mut d, Instant::now(), &pts);
+        let end = *pts.last().unwrap();
+        assert!(matches!(
+            hold(&mut d, t - Duration::from_millis(10), end, 500),
+            SnapEvent::None
+        ));
     }
 
     #[test]
